@@ -13,7 +13,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaDownload, FaEllipsisH, FaRecycle } from 'react-icons/fa';
 
-import { InstallType } from '../../../../plugin';
+import { enablePlugin, InstallType } from '../../../../plugin';
 import {
   StorePluginVersion,
   getPluginList,
@@ -35,6 +35,7 @@ async function reinstallPlugin(pluginName: string, currentVersion?: string) {
 
 type PluginTableData = PluginData & {
   name: string;
+  disabled: boolean;
   frozen: boolean;
   onFreeze(): void;
   onUnfreeze(): void;
@@ -54,12 +55,12 @@ function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }
     return null;
   }
 
-  const { name, update, version, onHide, onShow, hidden, onFreeze, onUnfreeze, frozen, isDeveloper } = props.entry.data;
+  const { name, update, version, onHide, onShow, hidden, onFreeze, onUnfreeze, frozen, isDeveloper, disabled } = props.entry.data;
 
   const showCtxMenu = (e: MouseEvent | GamepadEvent) => {
     showContextMenu(
       <Menu label={t('PluginListIndex.plugin_actions')}>
-        <MenuItem
+        {!disabled && <MenuItem
           onSelected={async () => {
             try {
               await reloadPluginBackend(name);
@@ -69,7 +70,7 @@ function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }
           }}
         >
           {t('PluginListIndex.reload')}
-        </MenuItem>
+        </MenuItem>}
         <MenuItem
           onSelected={() =>
             DeckyPluginLoader.uninstallPlugin(
@@ -82,11 +83,32 @@ function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }
         >
           {t('PluginListIndex.uninstall')}
         </MenuItem>
-        {hidden ? (
-          <MenuItem onSelected={onShow}>{t('PluginListIndex.show')}</MenuItem>
-        ) : (
-          <MenuItem onSelected={onHide}>{t('PluginListIndex.hide')}</MenuItem>
-        )}
+        {disabled ?
+          <MenuItem
+            onSelected={() => enablePlugin(name)}
+          >
+            {t('PluginListIndex.enable')}
+          </MenuItem> :
+          <MenuItem
+            onSelected={() =>
+              DeckyPluginLoader.disablePlugin(
+                name,
+                t('PluginLoader.plugin_disable.title', { name }),
+                t('PluginLoader.plugin_disable.button'),
+                t('PluginLoader.plugin_disable.desc', { name }),
+              )
+            }
+          >
+            {t('PluginListIndex.disable')}
+          </MenuItem>
+        }
+        {!disabled &&
+          (hidden ? (
+            <MenuItem onSelected={onShow}>{t('PluginListIndex.show')}</MenuItem>
+          ) : (
+            <MenuItem onSelected={onHide}>{t('PluginListIndex.hide')}</MenuItem>
+          )
+          )}
         {frozen ? (
           <MenuItem onSelected={onUnfreeze}>{t('PluginListIndex.unfreeze')}</MenuItem>
         ) : (
@@ -147,10 +169,11 @@ type PluginData = {
 };
 
 export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
-  const { plugins, updates, pluginOrder, setPluginOrder, frozenPlugins, hiddenPlugins } = useDeckyState();
+  const { installedPlugins, disabledPlugins, updates, pluginOrder, setPluginOrder, frozenPlugins, hiddenPlugins } = useDeckyState();
+
   const [_, setPluginOrderSetting] = useSetting<string[]>(
     'pluginOrder',
-    plugins.map((plugin) => plugin.name),
+    installedPlugins.map((plugin) => plugin.name),
   );
   const { t } = useTranslation();
 
@@ -164,15 +187,17 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
 
   useEffect(() => {
     setPluginEntries(
-      plugins.map(({ name, version }) => {
+      installedPlugins.map(({ name, version }) => {
         const frozen = frozenPlugins.includes(name);
         const hidden = hiddenPlugins.includes(name);
 
         return {
-          label: <PluginListLabel name={name} frozen={frozen} hidden={hidden} version={version} />,
+          label: <PluginListLabel name={name} frozen={frozen} hidden={hidden} version={version}
+            disabled={disabledPlugins.find(p => p.name == name) !== undefined} />,
           position: pluginOrder.indexOf(name),
           data: {
             name,
+            disabled: disabledPlugins.some(disabledPlugin => disabledPlugin.name === name),
             frozen,
             hidden,
             isDeveloper,
@@ -186,9 +211,9 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
         };
       }),
     );
-  }, [plugins, updates, hiddenPlugins]);
+  }, [installedPlugins, updates, hiddenPlugins, disabledPlugins]);
 
-  if (plugins.length === 0) {
+  if (installedPlugins.length === 0) {
     return (
       <div>
         <p>{t('PluginListIndex.no_plugin')}</p>

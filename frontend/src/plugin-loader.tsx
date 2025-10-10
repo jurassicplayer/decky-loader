@@ -30,7 +30,7 @@ import { FrozenPluginService } from './frozen-plugins-service';
 import { HiddenPluginsService } from './hidden-plugins-service';
 import Logger from './logger';
 import { NotificationService } from './notification-service';
-import { InstallType, Plugin, PluginLoadType } from './plugin';
+import { DisabledPlugin, InstallType, Plugin, PluginLoadType } from './plugin';
 import RouterHook from './router-hook';
 import { deinitSteamFixes, initSteamFixes } from './steamfixes';
 import { checkForPluginUpdates } from './store';
@@ -39,6 +39,7 @@ import Toaster from './toaster';
 import { getVersionInfo } from './updater';
 import { getSetting, setSetting } from './utils/settings';
 import TranslationHelper, { TranslationClass } from './utils/TranslationHelper';
+import PluginDisablelModal from './components/modals/PluginDisablelModal';
 
 const StorePage = lazy(() => import('./components/store/Store'));
 const SettingsPage = lazy(() => import('./components/settings'));
@@ -91,6 +92,7 @@ class PluginLoader extends Logger {
     DeckyBackend.addEventListener('loader/notify_updates', this.notifyUpdates.bind(this));
     DeckyBackend.addEventListener('loader/import_plugin', this.importPlugin.bind(this));
     DeckyBackend.addEventListener('loader/unload_plugin', this.unloadPlugin.bind(this));
+    DeckyBackend.addEventListener('loader/disable_plugin', this.doDisablePlugin.bind(this));
     DeckyBackend.addEventListener('loader/add_plugin_install_prompt', this.addPluginInstallPrompt.bind(this));
     DeckyBackend.addEventListener(
       'loader/add_multiple_plugins_install_prompt',
@@ -197,7 +199,7 @@ class PluginLoader extends Logger {
 
   private getPluginsFromBackend = DeckyBackend.callable<
     [],
-    { name: string; version: string; load_type: PluginLoadType }[]
+    { name: string; version: string; load_type: PluginLoadType; disabled: boolean }[]
   >('loader/get_plugins');
 
   private restartWebhelper = DeckyBackend.callable<[], void>('utilities/restart_webhelper');
@@ -206,10 +208,10 @@ class PluginLoader extends Logger {
     let registration: any;
     const uiMode = await new Promise(
       (r) =>
-        (registration = SteamClient.UI.RegisterForUIModeChanged((mode: EUIMode) => {
-          r(mode);
-          registration.unregister();
-        })),
+      (registration = SteamClient.UI.RegisterForUIModeChanged((mode: EUIMode) => {
+        r(mode);
+        registration.unregister();
+      })),
     );
     if (uiMode == EUIMode.GamePad) {
       // wait for SP window to exist before loading plugins
@@ -220,10 +222,16 @@ class PluginLoader extends Logger {
     this.runCrashChecker();
     const plugins = await this.getPluginsFromBackend();
     const pluginLoadPromises = [];
+    const disabledPlugins: DisabledPlugin[] = [];
     const loadStart = performance.now();
     for (const plugin of plugins) {
-      if (!this.hasPlugin(plugin.name))
-        pluginLoadPromises.push(this.importPlugin(plugin.name, plugin.version, plugin.load_type, false));
+      if (plugin.disabled) {
+        disabledPlugins.push({ name: plugin.name, version: plugin.version });
+        this.deckyState.setDisabledPlugins(disabledPlugins);
+      } else {
+        if (!this.hasPlugin(plugin.name))
+          pluginLoadPromises.push(this.importPlugin(plugin.name, plugin.version, plugin.load_type, false));
+      }
     }
     await Promise.all(pluginLoadPromises);
     const loadEnd = performance.now();
@@ -274,7 +282,7 @@ class PluginLoader extends Logger {
   public async checkPluginUpdates() {
     const frozenPlugins = this.deckyState.publicState().frozenPlugins;
 
-    const updates = await checkForPluginUpdates(this.plugins.filter((p) => !frozenPlugins.includes(p.name)));
+    const updates = await checkForPluginUpdates(this.deckyState.publicState().installedPlugins.filter((p) => !frozenPlugins.includes(p.name)));
     this.deckyState.setUpdates(updates);
     return updates;
   }
@@ -312,6 +320,7 @@ class PluginLoader extends Logger {
         version={version}
         hash={hash}
         installType={install_type}
+        disabled={this.deckyState.publicState().disabledPlugins.some(p => p.name === artifact)}
         onOK={() => DeckyBackend.call<[string]>('utilities/confirm_plugin_install', request_id)}
         onCancel={() => DeckyBackend.call<[string]>('utilities/cancel_plugin_install', request_id)}
       />,
@@ -325,6 +334,7 @@ class PluginLoader extends Logger {
     showModal(
       <MultiplePluginsInstallModal
         requests={requests}
+        disabledPlugins={this.deckyState.publicState().disabledPlugins}
         onOK={() => DeckyBackend.call<[string]>('utilities/confirm_plugin_install', request_id)}
         onCancel={() => DeckyBackend.call<[string]>('utilities/cancel_plugin_install', request_id)}
       />,
@@ -332,7 +342,11 @@ class PluginLoader extends Logger {
   }
 
   public uninstallPlugin(name: string, title: string, buttonText: string, description: string) {
-    showModal(<PluginUninstallModal name={name} title={title} buttonText={buttonText} description={description} />);
+    showModal(<PluginUninstallModal name={name} title={title} buttonText={buttonText} description={description} deckyState={this.deckyState}/>);
+  }
+
+  public disablePlugin(name: string, title: string, buttonText: string, description: string) {
+    showModal(<PluginDisablelModal name={name} title={title} buttonText={buttonText} description={description} />);
   }
 
   public hasPlugin(name: string) {
@@ -373,6 +387,17 @@ class PluginLoader extends Logger {
     this.errorBoundaryHook.deinit();
   }
 
+  public doDisablePlugin(name: string) {
+    const plugin = this.plugins.find((plugin) => plugin.name === name);
+    if (plugin == undefined) return;
+
+    plugin?.onDismount?.();
+    this.plugins = this.plugins.filter((p) => p !== plugin);
+    this.deckyState.setDisabledPlugins([...this.deckyState.publicState().disabledPlugins,
+    { name: plugin.name, version: plugin.version }]);
+    this.deckyState.setPlugins(this.plugins);
+  }
+
   public unloadPlugin(name: string, skipStateUpdate: boolean = false) {
     const plugin = this.plugins.find((plugin) => plugin.name === name);
     plugin?.onDismount?.();
@@ -392,15 +417,18 @@ class PluginLoader extends Logger {
       return;
     }
 
+
     try {
       if (useQueue) this.reloadLock = true;
       this.log(`Trying to load ${name}`);
 
       this.unloadPlugin(name, true);
       const startTime = performance.now();
+
       await this.importReactPlugin(name, version, loadType);
       const endTime = performance.now();
 
+      this.deckyState.setDisabledPlugins(this.deckyState.publicState().disabledPlugins.filter(d => d.name !== name));
       this.deckyState.setPlugins(this.plugins);
       this.log(`Loaded ${name} in ${endTime - startTime}ms`);
     } catch (e) {
@@ -410,7 +438,7 @@ class PluginLoader extends Logger {
         this.reloadLock = false;
         const nextPlugin = this.pluginReloadQueue.shift();
         if (nextPlugin) {
-          this.importPlugin(nextPlugin.name, nextPlugin.version, loadType);
+          this.importPlugin(nextPlugin.name, nextPlugin.version, nextPlugin.loadType);
         }
       }
     }
