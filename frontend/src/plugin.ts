@@ -1,3 +1,4 @@
+import type { JSX } from 'react';
 export enum PluginLoadType {
   LEGACY_EVAL_IIFE = 0, // legacy, uses legacy serverAPI
   ESMODULE_V1 = 1, // esmodule loading with modern @decky/backend apis
@@ -13,6 +14,8 @@ export interface Plugin {
   alwaysRender?: boolean;
   titleView?: JSX.Element;
 }
+
+export type DisabledPlugin = Pick<Plugin, 'name' | 'version'>;
 
 export enum InstallType {
   INSTALL,
@@ -55,3 +58,5 @@ type installPluginsArgs = [
 export let installPlugins = DeckyBackend.callable<installPluginsArgs>('utilities/install_plugins');
 
 export let uninstallPlugin = DeckyBackend.callable<[name: string]>('utilities/uninstall_plugin');
+export let enablePlugin = DeckyBackend.callable<[name: string]>('utilities/enable_plugin');
+export let disablePlugin = DeckyBackend.callable<[name: string]>('utilities/disable_plugin');

@@ -19,6 +19,7 @@ import { DeckyState, DeckyStateContextProvider, UserInfo, useDeckyState } from '
 import { File, FileSelectionType } from './components/modals/filepicker';
 import { deinitFilepickerPatches, initFilepickerPatches } from './components/modals/filepicker/patches';
 import MultiplePluginsInstallModal from './components/modals/MultiplePluginsInstallModal';
+import PluginDisableModal from './components/modals/PluginDisableModal';
 import PluginInstallModal from './components/modals/PluginInstallModal';
 import PluginUninstallModal from './components/modals/PluginUninstallModal';
 import NotificationBadge from './components/NotificationBadge';
@@ -30,7 +31,7 @@ import { FrozenPluginService } from './frozen-plugins-service';
 import { HiddenPluginsService } from './hidden-plugins-service';
 import Logger from './logger';
 import { NotificationService } from './notification-service';
-import { InstallType, Plugin, PluginLoadType } from './plugin';
+import { DisabledPlugin, InstallType, Plugin, PluginLoadType } from './plugin';
 import RouterHook from './router-hook';
 import { deinitSteamFixes, initSteamFixes } from './steamfixes';
 import { checkForPluginUpdates } from './store';
@@ -91,6 +92,7 @@ class PluginLoader extends Logger {
     DeckyBackend.addEventListener('loader/notify_updates', this.notifyUpdates.bind(this));
     DeckyBackend.addEventListener('loader/import_plugin', this.importPlugin.bind(this));
     DeckyBackend.addEventListener('loader/unload_plugin', this.unloadPlugin.bind(this));
+    DeckyBackend.addEventListener('loader/disable_plugin', this.doDisablePlugin.bind(this));
     DeckyBackend.addEventListener('loader/add_plugin_install_prompt', this.addPluginInstallPrompt.bind(this));
     DeckyBackend.addEventListener(
       'loader/add_multiple_plugins_install_prompt',
@@ -120,28 +122,6 @@ class PluginLoader extends Logger {
         <DeckyStateContextProvider deckyState={this.deckyState}>
           <FaPlug />
           <TabBadge />
-          <style>
-            {`
-              /* fixes random overscrolling in QAM */
-              .${quickAccessMenuClasses?.TabContentColumn} {
-                flex-grow: 1 !important;
-                margin-top: 0 !important;
-                margin-bottom: 0 !important;
-                justify-content: center !important;
-              }
-              .${quickAccessMenuClasses?.Tab} {
-                flex-grow: 1 !important;
-                height: unset !important;
-                --decky-qam-tab-max-height: 64px; /* make things a little easier for themers */
-                max-height: var(--decky-qam-tab-max-height) !important;
-              }
-              /* they broke the footer a while ago and forgot to update the styles LOL */
-              .${quickAccessMenuClasses?.Tabs}.${quickAccessMenuClasses.TabsWithFooter} {
-                margin-bottom: 0 !important;
-                padding-bottom: 0 !important;
-              }
-            `}
-          </style>
         </DeckyStateContextProvider>
       ),
     });
@@ -197,7 +177,7 @@ class PluginLoader extends Logger {
 
   private getPluginsFromBackend = DeckyBackend.callable<
     [],
-    { name: string; version: string; load_type: PluginLoadType }[]
+    { name: string; version: string; load_type: PluginLoadType; disabled: boolean }[]
   >('loader/get_plugins');
 
   private restartWebhelper = DeckyBackend.callable<[], void>('utilities/restart_webhelper');
@@ -220,10 +200,16 @@ class PluginLoader extends Logger {
     this.runCrashChecker();
     const plugins = await this.getPluginsFromBackend();
     const pluginLoadPromises = [];
+    const disabledPlugins: DisabledPlugin[] = [];
     const loadStart = performance.now();
     for (const plugin of plugins) {
-      if (!this.hasPlugin(plugin.name))
-        pluginLoadPromises.push(this.importPlugin(plugin.name, plugin.version, plugin.load_type, false));
+      if (plugin.disabled) {
+        disabledPlugins.push({ name: plugin.name, version: plugin.version });
+        this.deckyState.setDisabledPlugins(disabledPlugins);
+      } else {
+        if (!this.hasPlugin(plugin.name))
+          pluginLoadPromises.push(this.importPlugin(plugin.name, plugin.version, plugin.load_type, false));
+      }
     }
     await Promise.all(pluginLoadPromises);
     const loadEnd = performance.now();
@@ -274,7 +260,9 @@ class PluginLoader extends Logger {
   public async checkPluginUpdates() {
     const frozenPlugins = this.deckyState.publicState().frozenPlugins;
 
-    const updates = await checkForPluginUpdates(this.plugins.filter((p) => !frozenPlugins.includes(p.name)));
+    const updates = await checkForPluginUpdates(
+      this.deckyState.publicState().installedPlugins.filter((p) => !frozenPlugins.includes(p.name)),
+    );
     this.deckyState.setUpdates(updates);
     return updates;
   }
@@ -312,6 +300,7 @@ class PluginLoader extends Logger {
         version={version}
         hash={hash}
         installType={install_type}
+        disabled={this.deckyState.publicState().disabledPlugins.some((p) => p.name === artifact)}
         onOK={() => DeckyBackend.call<[string]>('utilities/confirm_plugin_install', request_id)}
         onCancel={() => DeckyBackend.call<[string]>('utilities/cancel_plugin_install', request_id)}
       />,
@@ -325,6 +314,7 @@ class PluginLoader extends Logger {
     showModal(
       <MultiplePluginsInstallModal
         requests={requests}
+        disabledPlugins={this.deckyState.publicState().disabledPlugins}
         onOK={() => DeckyBackend.call<[string]>('utilities/confirm_plugin_install', request_id)}
         onCancel={() => DeckyBackend.call<[string]>('utilities/cancel_plugin_install', request_id)}
       />,
@@ -332,7 +322,19 @@ class PluginLoader extends Logger {
   }
 
   public uninstallPlugin(name: string, title: string, buttonText: string, description: string) {
-    showModal(<PluginUninstallModal name={name} title={title} buttonText={buttonText} description={description} />);
+    showModal(
+      <PluginUninstallModal
+        name={name}
+        title={title}
+        buttonText={buttonText}
+        description={description}
+        deckyState={this.deckyState}
+      />,
+    );
+  }
+
+  public disablePlugin(name: string, title: string, buttonText: string, description: string) {
+    showModal(<PluginDisableModal name={name} title={title} buttonText={buttonText} description={description} />);
   }
 
   public hasPlugin(name: string) {
@@ -373,6 +375,19 @@ class PluginLoader extends Logger {
     this.errorBoundaryHook.deinit();
   }
 
+  public doDisablePlugin(name: string) {
+    const plugin = this.plugins.find((plugin) => plugin.name === name);
+    if (plugin == undefined) return;
+
+    plugin?.onDismount?.();
+    this.plugins = this.plugins.filter((p) => p !== plugin);
+    this.deckyState.setDisabledPlugins([
+      ...this.deckyState.publicState().disabledPlugins,
+      { name: plugin.name, version: plugin.version },
+    ]);
+    this.deckyState.setPlugins(this.plugins);
+  }
+
   public unloadPlugin(name: string, skipStateUpdate: boolean = false) {
     const plugin = this.plugins.find((plugin) => plugin.name === name);
     plugin?.onDismount?.();
@@ -385,6 +400,7 @@ class PluginLoader extends Logger {
     version?: string | undefined,
     loadType: PluginLoadType = PluginLoadType.ESMODULE_V1,
     useQueue: boolean = true,
+    timeoutMS?: number,
   ) {
     if (useQueue && this.reloadLock) {
       this.log('Reload currently in progress, adding to queue', name);
@@ -398,9 +414,11 @@ class PluginLoader extends Logger {
 
       this.unloadPlugin(name, true);
       const startTime = performance.now();
-      await this.importReactPlugin(name, version, loadType);
+
+      await this.importReactPlugin(name, version, loadType, timeoutMS);
       const endTime = performance.now();
 
+      this.deckyState.setDisabledPlugins(this.deckyState.publicState().disabledPlugins.filter((d) => d.name !== name));
       this.deckyState.setPlugins(this.plugins);
       this.log(`Loaded ${name} in ${endTime - startTime}ms`);
     } catch (e) {
@@ -410,7 +428,7 @@ class PluginLoader extends Logger {
         this.reloadLock = false;
         const nextPlugin = this.pluginReloadQueue.shift();
         if (nextPlugin) {
-          this.importPlugin(nextPlugin.name, nextPlugin.version, loadType);
+          this.importPlugin(nextPlugin.name, nextPlugin.version, nextPlugin.loadType, true, timeoutMS);
         }
       }
     }
@@ -420,12 +438,28 @@ class PluginLoader extends Logger {
     name: string,
     version?: string,
     loadType: PluginLoadType = PluginLoadType.ESMODULE_V1,
+    timeoutMS?: number,
   ) {
     let spExists = this.checkForSP();
+    const timeoutException = new Error(
+      `${name} failed to load within ${timeoutMS ? `${timeoutMS / 1000} second` : ''} time limit`,
+    );
+    let timeout: number | undefined;
+
     try {
       switch (loadType) {
         case PluginLoadType.ESMODULE_V1:
-          const plugin_exports = await import(`http://127.0.0.1:1337/plugins/${name}/dist/index.js?t=${Date.now()}`);
+          const importJS = () => import(`http://127.0.0.1:1337/plugins/${name}/dist/index.js?t=${Date.now()}`);
+
+          const promise =
+            timeoutMS === undefined
+              ? importJS()
+              : Promise.race([
+                  importJS(),
+                  new Promise((_, reject) => (timeout = setTimeout(() => reject(timeoutException), timeoutMS))),
+                ]);
+
+          const plugin_exports = await promise;
           let plugin = plugin_exports.default();
 
           this.plugins.push({
@@ -437,12 +471,26 @@ class PluginLoader extends Logger {
           break;
 
         case PluginLoadType.LEGACY_EVAL_IIFE:
-          let res = await fetch(`http://127.0.0.1:1337/plugins/${name}/frontend_bundle`, {
-            credentials: 'include',
-            headers: {
-              'X-Decky-Auth': deckyAuthToken,
-            },
-          });
+          const fetchJS = async () => {
+            const controller = new AbortController();
+            const { signal } = controller;
+
+            if (timeoutMS !== undefined) timeout = setTimeout(() => controller.abort(), timeoutMS);
+
+            try {
+              return await fetch(`http://127.0.0.1:1337/plugins/${name}/frontend_bundle`, {
+                credentials: 'include',
+                headers: {
+                  'X-Decky-Auth': deckyAuthToken,
+                },
+                signal,
+              });
+            } catch (e: any) {
+              throw 'name' in e && e.name === 'AbortError' ? timeoutException : e;
+            }
+          };
+
+          let res = await fetchJS();
           if (res.ok) {
             let plugin_export: (serverAPI: any) => Plugin = await eval(
               (await res.text()) + `\n//# sourceURL=decky://decky/legacy_plugin/${encodeURIComponent(name)}/index.js`,
@@ -461,6 +509,8 @@ class PluginLoader extends Logger {
           throw new Error(`${name} has no defined loadType.`);
       }
     } catch (e) {
+      if (e === timeoutException) throw timeoutException;
+
       this.error('Error loading plugin ' + name, e);
       const TheError: FC<{}> = () => (
         <PanelSection>
@@ -503,6 +553,8 @@ class PluginLoader extends Logger {
         body: '' + e,
         icon: <FaExclamationCircle />,
       });
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
 
     if (spExists && !this.checkForSP()) {
